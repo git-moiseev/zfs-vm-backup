@@ -222,37 +222,55 @@ get_recent_bookmark() {
     local REMOTE_HOST="$3"
     local REMOTE_DS="$4"
 
-    declare -A BM_BY_GUID
-    declare -A NAME_BY_GUID
-
     LAST_RECENT_BOOKMARK=""
     REMOTE_SNAP_TO_DELETE=""
 
-    # Remote snapshots sorted from newest to oldest
-    REMOTE_GUIDS=$(ssh "${REMOTE_USER}@${REMOTE_HOST}" \
+    # --- Declare arrays ---
+    declare -A NAME_BY_GUID          # Remote snapshots: GUID → name
+    declare -A BM_BY_GUID            # Local bookmarks: GUID → space-separated names
+    # Associative arrays in Bash are unordered: ${!BM_BY_GUID[@]} returns keys in arbitrary order (depends on the internal hash table).
+    declare -a REMOTE_GUIDS_ORDER    # Order of remote snapshots newest → oldest
+    declare -a LOCAL_GUIDS_ORDER     # Order of local bookmarks newest → oldest
+
+    # --- Remote snapshots ---
+    while read -r R_NAME R_GUID; do
+        # Trim hidden chars
+        R_NAME="${R_NAME//[$'\r\n']}"
+        R_GUID="${R_GUID//[$'\r\n']}"
+        NAME_BY_GUID["$R_GUID"]="$R_NAME"
+        REMOTE_GUIDS_ORDER+=("$R_GUID")
+    done < <(ssh "${REMOTE_USER}@${REMOTE_HOST}" \
         zfs list -H -t snapshot -o name,guid -S creation -r "${REMOTE_DS}" 2>/dev/null)
 
-    [ -z "${REMOTE_GUIDS}" ] && return 0
+    [ ${#REMOTE_GUIDS_ORDER[@]} -eq 0 ] && return 0
 
-    while read -r R_NAME R_GUID; do
-        NAME_BY_GUID["${R_GUID}"]="${R_NAME}"
-    done <<< "${REMOTE_GUIDS}"
+    log "REMOTE_GUIDS_ORDER=${REMOTE_GUIDS_ORDER[*]}"
 
-    # Local bookmarks
-    LOCAL_BMS=$(zfs list -H -t bookmark -o name,guid -S creation -r "${LOCAL_DS}")
-
+    # --- Local bookmarks ---
     while read -r NAME GUID; do
-        BM_BY_GUID["${GUID}"]="${NAME}"
-    done <<< "${LOCAL_BMS}"
+        NAME="${NAME//[$'\r\n']}"
+        GUID="${GUID//[$'\r\n']}"
+        # Append to existing list if duplicate GUID
+        if [ -n "${BM_BY_GUID[$GUID]}" ]; then
+            BM_BY_GUID["$GUID"]="${BM_BY_GUID[$GUID]} $NAME"
+        else
+            BM_BY_GUID["$GUID"]="$NAME"
+            LOCAL_GUIDS_ORDER+=("$GUID")  # Maintain insertion order
+        fi
+        log "BM_BY_GUID['$GUID']=${BM_BY_GUID[$GUID]}"
+    done < <(zfs list -H -t bookmark -o name,guid -S creation -r "${LOCAL_DS}")
 
-    # Walk remote snapshots from newest to oldest
-    for R_GUID in "${!NAME_BY_GUID[@]}"; do
-        BOOKMARK="${BM_BY_GUID[${R_GUID}]}"
-        if [ -n "${BOOKMARK}" ]; then
-            LAST_RECENT_BOOKMARK="${BOOKMARK}"
+    log "LOCAL_GUIDS_ORDER=${LOCAL_GUIDS_ORDER[*]}"
+
+    # --- Walk remote snapshots newest → oldest ---
+    for R_GUID in "${REMOTE_GUIDS_ORDER[@]}"; do
+        if [ -n "${BM_BY_GUID[$R_GUID]}" ]; then
+            # Pick the newest local bookmark for this GUID (first in list)
+            LAST_RECENT_BOOKMARK="${BM_BY_GUID[$R_GUID]%% *}"
+            log "Found recent bookmark: $LAST_RECENT_BOOKMARK"
             return 0
         else
-            REMOTE_SNAP_TO_DELETE="${REMOTE_SNAP_TO_DELETE} ${NAME_BY_GUID[${R_GUID}]}"
+            REMOTE_SNAP_TO_DELETE="$REMOTE_SNAP_TO_DELETE ${NAME_BY_GUID[$R_GUID]}"
         fi
     done
 }
