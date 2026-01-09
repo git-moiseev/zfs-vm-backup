@@ -36,7 +36,7 @@ ARCHIVE_HOST="nfs9"
 ARCHIVE_PATH="tank/archive/${HOSTNAME}"
 
 # Local retention policy
-KEEP_LOCAL=5   # number of latest snapshots to keep locally
+KEEP_LOCAL=15   # number of latest snapshots to keep locally
 
 # Transfer tuning
 MBUFFER_MEM="2G"
@@ -59,6 +59,12 @@ YEAR=$(date +%Y)
 
 log() {
     echo "[$(date +'%Y-%m-%d %H:%M:%S')] $*"
+}
+
+debug() {
+    if [ ${DEBUG} -eq 1 ]; then
+        echo "[$(date +'%Y-%m-%d %H:%M:%S')] $*"
+    fi
 }
 
 # ============================================================
@@ -163,9 +169,9 @@ done
 run_cmd() {
     local CMD="$*"
 
-    if [ "${DRY_RUN}" -eq 1 ]; then
+    if [ ${DRY_RUN} -eq 1 ]; then
         log "[DRY-RUN] ${CMD}"
-    elif [ "${DEBUG}" -eq 1 ]; then
+    elif [ ${DEBUG} -eq 1 ]; then
         log "[DEBUG] ${CMD}"
         eval "${CMD}"
     else
@@ -244,7 +250,7 @@ get_recent_bookmark() {
 
     [ ${#REMOTE_GUIDS_ORDER[@]} -eq 0 ] && return 0
 
-    log "REMOTE_GUIDS_ORDER=${REMOTE_GUIDS_ORDER[*]}"
+    debug "REMOTE_GUIDS_ORDER=${REMOTE_GUIDS_ORDER[*]}"
 
     # --- Local bookmarks ---
     while read -r NAME GUID; do
@@ -257,17 +263,17 @@ get_recent_bookmark() {
             BM_BY_GUID["$GUID"]="$NAME"
             LOCAL_GUIDS_ORDER+=("$GUID")  # Maintain insertion order
         fi
-        log "BM_BY_GUID['$GUID']=${BM_BY_GUID[$GUID]}"
+        debug "BM_BY_GUID['$GUID']=${BM_BY_GUID[$GUID]}"
     done < <(zfs list -H -t bookmark -o name,guid -S creation -r "${LOCAL_DS}")
 
-    log "LOCAL_GUIDS_ORDER=${LOCAL_GUIDS_ORDER[*]}"
+    debug "LOCAL_GUIDS_ORDER=${LOCAL_GUIDS_ORDER[*]}"
 
     # --- Walk remote snapshots newest → oldest ---
     for R_GUID in "${REMOTE_GUIDS_ORDER[@]}"; do
         if [ -n "${BM_BY_GUID[$R_GUID]}" ]; then
             # Pick the newest local bookmark for this GUID (first in list)
             LAST_RECENT_BOOKMARK="${BM_BY_GUID[$R_GUID]%% *}"
-            log "Found recent bookmark: $LAST_RECENT_BOOKMARK"
+            debug "Found recent bookmark: $LAST_RECENT_BOOKMARK"
             return 0
         else
             REMOTE_SNAP_TO_DELETE="$REMOTE_SNAP_TO_DELETE ${NAME_BY_GUID[$R_GUID]}"
@@ -325,7 +331,7 @@ send_increment() {
 # ============================================================
 
 copy_manifests() {
-    run_cmd "rsync -av --copy-links --delete /etc/pve/qemu-server /${LOCAL_DS}/"
+    run_cmd "rsync -a --copy-links --delete /etc/pve/qemu-server /${LOCAL_DS}/"
 }
 
 # ============================================================
@@ -345,4 +351,8 @@ if [ "${DAY}" = "01" ]; then
     send_increment "X" "${DATE}" "${ARCHIVE_USER}" "${ARCHIVE_HOST}" "${ARCHIVE_PATH}" "${YEAR}-${MONTH}"
 fi
 
-log "Backup & archive workflow completed."
+
+log "LAST_RECENT_BOOKMARK=$LAST_RECENT_BOOKMARK"
+
+# log "Backup & archive workflow completed."
+
