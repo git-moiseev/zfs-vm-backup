@@ -104,23 +104,18 @@ This guarantees:
 
 ```mermaid
 flowchart TD
+    A[Proxmox Host] --> B[Local ZFS Dataset]
+    B -->|Create snapshot| C[Local Snapshot]
+    C -->|Create bookmark| D[Local Bookmark]
 
-    A[Proxmox Host] -->|Create snapshot| B[Local ZFS Snapshot]
-    B -->|Create bookmark| C[Local ZFS Bookmark]
+    C -->|Incremental send| E[Backup Server nfs8]
+    E --> F[ZFS Backup Dataset]
 
-    B -->|Rotate snapshots| D[Keep last N snapshots]
+    C -->|Monthly snapshot| G[Archive Server nfs9]
+    G --> H[ZFS Archive Dataset]
 
-    C -->|Incremental send (GUID-based)| E[nfs8 Backup Server]
-
-    E -->|Rotation| F[Nearline Backup Retention]
-
-    C -->|Monthly only| G[nfs9 Archive Server]
-    G -->|Rename YYYY-Mon| H[Permanent Archive]
-
-    subgraph Failure Recovery
-        E -->|List GUIDs| I[Find newest matching bookmark]
-        I -->|Resume incremental send| G
-    end
+    F -->|Retention policy| I[Rotate and Expire]
+    H -->|Infinite retention| J[Long-term Archive]
 ```
 
 ---
