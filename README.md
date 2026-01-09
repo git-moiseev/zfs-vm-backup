@@ -174,8 +174,7 @@ This project is designed for:
 
 ## License
 
-MIT (or your preferred license)
-
+MIT 
 ---
 
 ## Final Note
