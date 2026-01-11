@@ -45,7 +45,12 @@ MBUFFER_SPEED=""
 # Interactive mode:
 #   1 = show progress (manual run)
 #   0 = silent (cron)
-INTERACTIVE=1
+if  [[ -t 0 ]]; then 
+    INTERACTIVE=1
+else
+    INTERACTIVE=0
+fi
+    
 
 # Time-related variables
 DATE=$(date +%Y-%m-%d-%H%M%S)
@@ -58,11 +63,16 @@ YEAR=$(date +%Y)
 # ============================================================
 
 log() {
-    echo "[$(date +'%Y-%m-%d %H:%M:%S')] $*"
+    if [ $INTERACTIVE -eq 1 ]; then 
+        echo "[$(date +'%Y-%m-%d %H:%M:%S')] $*"
+    fi
+    logger -t backup "$*"
 }
 
 debug() {
-    if [ ${DEBUG} -eq 1 ]; then
+    local LEVEL=${1:-1}
+    if [ ${LEVEL} -le ${DEBUG} ]; then
+        shift # Remove $1 from $*
         echo "[$(date +'%Y-%m-%d %H:%M:%S')] $*"
     fi
 }
@@ -78,7 +88,8 @@ Usage: vm-backup.sh [options]
 Options:
   --help                    Show this help and exit
   --dry-run                 Show commands without executing them
-  --debug                   Enable verbose debug output
+  --archive                 Force send datastore to archive
+  --debug LEVEL             Enable verbose debug output LEVELS 1, 2, 3
 
   --dataset DATASET         Local ZFS dataset to backup
                              (default: tank/test)
@@ -107,7 +118,7 @@ EOF
 # ============================================================
 
 OPTIONS=$(getopt -o h \
-    --long help,dry-run,debug,dataset:,backup-host:,backup-dataset:,archive-host:,archive-dataset: \
+    --long help,dry-run,archive,debug:,dataset:,backup-host:,backup-dataset:,archive-host:,archive-dataset: \
     -n 'vm-backup.sh' -- "$@")
 
 if [ $? != 0 ]; then
@@ -127,9 +138,13 @@ while true; do
             DRY_RUN=1
             shift
             ;;
-        --debug)
-            DEBUG=1
+        --archive)
+            FORCE_ARCHIVE=1
             shift
+            ;;
+        --debug)
+            DEBUG="$2"
+            shift 2
             ;;
         --dataset)
             LOCAL_DS="$2"
@@ -250,7 +265,7 @@ get_recent_bookmark() {
 
     [ ${#REMOTE_GUIDS_ORDER[@]} -eq 0 ] && return 0
 
-    debug "REMOTE_GUIDS_ORDER=${REMOTE_GUIDS_ORDER[*]}"
+    debug 2 "REMOTE_GUIDS_ORDER=${REMOTE_GUIDS_ORDER[*]}"
 
     # --- Local bookmarks ---
     while read -r NAME GUID; do
@@ -263,17 +278,16 @@ get_recent_bookmark() {
             BM_BY_GUID["$GUID"]="$NAME"
             LOCAL_GUIDS_ORDER+=("$GUID")  # Maintain insertion order
         fi
-        debug "BM_BY_GUID['$GUID']=${BM_BY_GUID[$GUID]}"
+        debug 2 "BM_BY_GUID['$GUID']=${BM_BY_GUID[$GUID]}"
     done < <(zfs list -H -t bookmark -o name,guid -S creation -r "${LOCAL_DS}")
 
-    debug "LOCAL_GUIDS_ORDER=${LOCAL_GUIDS_ORDER[*]}"
+    debug 2 "LOCAL_GUIDS_ORDER=${LOCAL_GUIDS_ORDER[*]}"
 
     # --- Walk remote snapshots newest → oldest ---
     for R_GUID in "${REMOTE_GUIDS_ORDER[@]}"; do
         if [ -n "${BM_BY_GUID[$R_GUID]}" ]; then
             # Pick the newest local bookmark for this GUID (first in list)
             LAST_RECENT_BOOKMARK="${BM_BY_GUID[$R_GUID]%% *}"
-            debug "Found recent bookmark: $LAST_RECENT_BOOKMARK"
             return 0
         else
             REMOTE_SNAP_TO_DELETE="$REMOTE_SNAP_TO_DELETE ${NAME_BY_GUID[$R_GUID]}"
@@ -292,9 +306,11 @@ send_increment() {
     local REMOTE_DS="$5"
 
     get_recent_bookmark "${LOCAL_DS}" "${REMOTE_USER}" "${REMOTE_HOST}" "${REMOTE_DS}"
+    log "Found recent bookmark: ${LAST_RECENT_BOOKMARK}"
 
     # Cleanup incompatible remote snapshots
     if [ -n "${REMOTE_SNAP_TO_DELETE}" ]; then
+    log "Remote snapsot to delete: ${REMOTE_SNAP_TO_DELETE}"
         for R_SNAP in ${REMOTE_SNAP_TO_DELETE}; do
             log "Removing remote snapshot ${R_SNAP}"
             run_cmd "ssh ${REMOTE_USER}@${REMOTE_HOST} zfs destroy -r ${R_SNAP}" || true
@@ -312,9 +328,9 @@ send_increment() {
 
     if [ "${INTERACTIVE}" -eq 1 ]; then
         STREAM_SIZE=$(${SEND_CMD} -Pn | tail -1 | awk '{print $2}')
-        CMD="${SEND_CMD} | pv -s ${STREAM_SIZE} | mbuffer -s 1M -m ${MBUFFER_MEM} -L ${MBUFFER_SPEED} | ssh ${REMOTE_USER}@${REMOTE_HOST} zfs recv -Fu ${REMOTE_DS}"
+        CMD="${SEND_CMD} | pv -s ${STREAM_SIZE} | mbuffer -q -s 1M -m ${MBUFFER_MEM} -L ${MBUFFER_SPEED} | ssh ${REMOTE_USER}@${REMOTE_HOST} zfs recv -Fu ${REMOTE_DS}"
     else
-        CMD="${SEND_CMD} | mbuffer -s 1M -m ${MBUFFER_MEM} -L ${MBUFFER_SPEED} | ssh ${REMOTE_USER}@${REMOTE_HOST} zfs recv -Fu ${REMOTE_DS}"
+        CMD="${SEND_CMD} | mbuffer -q -s 1M -m ${MBUFFER_MEM} -L ${MBUFFER_SPEED} | ssh ${REMOTE_USER}@${REMOTE_HOST} zfs recv -Fu ${REMOTE_DS}"
     fi
 
     run_cmd "${CMD}"
@@ -347,8 +363,8 @@ snapshot_local "${DATE}"
 send_increment "X" "${DATE}" "${BACKUP_USER}" "${BACKUP_HOST}" "${BACKUP_PATH}"
 
 # Offsite archive (monthly)
-if [ "${DAY}" = "01" ]; then
-    send_increment "X" "${DATE}" "${ARCHIVE_USER}" "${ARCHIVE_HOST}" "${ARCHIVE_PATH}" "${YEAR}-${MONTH}"
+if [ -n "$FORCE_ARCHIVE" -o "${DAY}" = "01" ]; then
+    send_increment "X" "${DATE}" "${ARCHIVE_USER}" "${ARCHIVE_HOST}" "${ARCHIVE_PATH}" "${YEAR}-${MONTH}-${DAY}"
 fi
 
 
