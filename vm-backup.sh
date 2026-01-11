@@ -73,6 +73,8 @@ if [[ -f $PIDFILE ]]; then
 fi
 
 echo $$ >"$PIDFILE"
+# PID file is always deleted, even if the script crashes or is interrupted.
+trap 'rm -f "$PIDFILE"' EXIT
 
 # ============================================================
 # Logging helpers
@@ -411,19 +413,4 @@ if [ -n "$FORCE_ARCHIVE" -o "${DAY}" = "01" ]; then
 fi
 
 log "Backup & archive workflow completed."
-PIDFILE=/var/run/zfs-send-rpool-test.pid
-
-# Prevent double start
-if [[ -f $PIDFILE ]]; then
-    oldpid=$(<"$PIDFILE")
-    if kill -0 "$oldpid" 2>/dev/null; then
-        echo "zfs send already running (pid $oldpid), exiting"
-        exit 0
-    else
-        echo "stale pidfile found, removing"
-        rm -f "$PIDFILE"
-    fi
-fi
-
-echo $$ >"$PIDFILE"
 
