@@ -13,7 +13,7 @@
 #  - cron-friendly dry-run and debug modes
 #
 
-# set -euo pipefail
+set -euo pipefail
 
 # ============================================================
 # Default configuration (policy-level parameters)
@@ -57,6 +57,22 @@ DATE=$(date +%Y-%m-%d-%H%M%S)
 DAY=$(date +%d)
 MONTH=$(date +%b)
 YEAR=$(date +%Y)
+
+PIDFILE=/var/run/zfs-send-recv.pid
+
+# Prevent double start
+if [[ -f $PIDFILE ]]; then
+    oldpid=$(<"$PIDFILE")
+    if kill -0 "$oldpid" 2>/dev/null; then
+        log "zfs send already running (pid $oldpid), exiting"
+        exit 0
+    else
+        log "Stale pidfile found, removing"
+        rm -f "$PIDFILE"
+    fi
+fi
+
+echo $$ >"$PIDFILE"
 
 # ============================================================
 # Logging helpers
@@ -193,6 +209,8 @@ run_cmd() {
         eval "${CMD}"
     fi
 }
+# Ensures the PID file is removed even if the script is killed
+trap 'rm -f "$PIDFILE"' EXIT
 
 # ============================================================
 # 1) Local snapshot creation + rotation + bookmark
@@ -232,6 +250,9 @@ snapshot_local() {
 # ============================================================
 # 2) Find the most recent local bookmark matching
 #    any remote snapshot GUID
+# Sets a global variables LAST_RECENT_BOOKMARK, REMOTE_SNAP_TO_DELETE
+# If matched bookmark does not exists or has descendants on remote 
+# side they must to be deleted before send datastream
 #
 # Purpose:
 #  - Resume incremental replication after outages
@@ -272,7 +293,7 @@ get_recent_bookmark() {
         NAME="${NAME//[$'\r\n']}"
         GUID="${GUID//[$'\r\n']}"
         # Append to existing list if duplicate GUID
-        if [ -n "${BM_BY_GUID[$GUID]}" ]; then
+        if [ -n "${BM_BY_GUID[$GUID]:-}" ]; then
             BM_BY_GUID["$GUID"]="${BM_BY_GUID[$GUID]} $NAME"
         else
             BM_BY_GUID["$GUID"]="$NAME"
@@ -296,7 +317,28 @@ get_recent_bookmark() {
 }
 
 # ============================================================
-# 3) Incremental (or full) send to remote host
+# 3)Determine it is a first bookmark for today
+# ============================================================
+
+is_first_bookmark_today() {
+    local bm="$1"
+    local today_start min_bm="" min_ts=""
+
+    today_start=$(date -d 'today 00:00' +%s)
+
+    while read -r name ts; do
+        (( ts < today_start )) && continue
+        if [[ -z $min_ts || ts -lt min_ts ]]; then
+            min_ts=$ts
+            min_bm=$name
+        fi
+    done < <(zfs list -H -t bookmark -o name,creation -p rpool/test)
+
+    [[ -n $min_bm && $bm == "$min_bm" ]]
+}
+
+# ============================================================
+# 4) Incremental (or full) send to remote host
 # ============================================================
 
 send_increment() {
@@ -304,6 +346,7 @@ send_increment() {
     local REMOTE_USER="$3"
     local REMOTE_HOST="$4"
     local REMOTE_DS="$5"
+    local NEW_SNAP_NAME="${6:-}"
 
     get_recent_bookmark "${LOCAL_DS}" "${REMOTE_USER}" "${REMOTE_HOST}" "${REMOTE_DS}"
     log "Found recent bookmark: ${LAST_RECENT_BOOKMARK}"
@@ -336,14 +379,14 @@ send_increment() {
     run_cmd "${CMD}"
 
     # Optional rename (used for monthly archives)
-    if [[ -n ${6+x} && -n $6 ]]; then
-        NEW_SNAP_NAME="$6"
+    if [[ -n "$NEW_SNAP_NAME" ]]; then
         run_cmd "ssh ${REMOTE_USER}@${REMOTE_HOST} zfs rename ${REMOTE_DS}@${SNAP} ${REMOTE_DS}@${NEW_SNAP_NAME}"
     fi
 }
 
+
 # ============================================================
-# Copy Proxmox VM configuration (manifests)
+# 5) Copy Proxmox VM configuration (manifests)
 # ============================================================
 
 copy_manifests() {
@@ -367,8 +410,20 @@ if [ -n "$FORCE_ARCHIVE" -o "${DAY}" = "01" ]; then
     send_increment "X" "${DATE}" "${ARCHIVE_USER}" "${ARCHIVE_HOST}" "${ARCHIVE_PATH}" "${YEAR}-${MONTH}-${DAY}"
 fi
 
+log "Backup & archive workflow completed."
+PIDFILE=/var/run/zfs-send-rpool-test.pid
 
-log "LAST_RECENT_BOOKMARK=$LAST_RECENT_BOOKMARK"
+# Prevent double start
+if [[ -f $PIDFILE ]]; then
+    oldpid=$(<"$PIDFILE")
+    if kill -0 "$oldpid" 2>/dev/null; then
+        echo "zfs send already running (pid $oldpid), exiting"
+        exit 0
+    else
+        echo "stale pidfile found, removing"
+        rm -f "$PIDFILE"
+    fi
+fi
 
-# log "Backup & archive workflow completed."
+echo $$ >"$PIDFILE"
 
