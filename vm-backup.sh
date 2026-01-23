@@ -13,7 +13,7 @@
 #  - cron-friendly dry-run and debug modes
 #
 
-set -euo pipefail
+set -eo pipefail
 
 # ============================================================
 # Default configuration (policy-level parameters)
@@ -36,7 +36,9 @@ ARCHIVE_HOST="nfs9"
 ARCHIVE_PATH="tank/archive/${HOSTNAME}"
 
 # Local retention policy
-KEEP_LOCAL=15   # number of latest snapshots to keep locally
+KEEP_LOCAL=50   # number of latest snapshots to keep locally
+KEEP_UNTIL=     # YYMMDD format date 
+SET_NAME=       # Set snapshot name
 
 # Transfer tuning
 MBUFFER_MEM="2G"
@@ -136,7 +138,7 @@ EOF
 # ============================================================
 
 OPTIONS=$(getopt -o h \
-    --long help,dry-run,archive,debug:,dataset:,backup-host:,backup-dataset:,archive-host:,archive-dataset: \
+    --long help,dry-run,archive,debug:,dataset:,backup-host:,backup-dataset:,archive-host:,archive-dataset:,keep:,keep-until:,rename: \
     -n 'vm-backup.sh' -- "$@")
 
 if [ $? != 0 ]; then
@@ -184,6 +186,18 @@ while true; do
             ARCHIVE_PATH="$2"
             shift 2
             ;;
+        --keep)
+            KEEP_LOCAL="$2"
+            shift 2
+            ;;
+        --keep-until)
+            KEEP_UNTIL="$2"
+            shift 2
+            ;;
+        --rename)
+            SET_NAME="$2"
+            shift 2
+            ;;
         --)
             shift
             break
@@ -211,8 +225,19 @@ run_cmd() {
         eval "${CMD}"
     fi
 }
-# Ensures the PID file is removed even if the script is killed
-trap 'rm -f "$PIDFILE"' EXIT
+
+zfs_set_keep_until() {
+    local dataset="$1"
+    local date="$2"
+    local prop="custom:keep-until"
+
+    # basic YYYYMMDD validation
+    if [[ "$date" =~ ^[0-9]{8}$ ]]; then
+       run_cmd zfs set "$prop=$date" "$dataset"
+    else
+       log "Invalid date format (expected YYYYMMDD)"
+    fi
+}
 
 # ============================================================
 # 1) Local snapshot creation + rotation + bookmark
@@ -230,10 +255,36 @@ snapshot_local() {
 
     log "Creating snapshot ${FULL_SNAP_NAME}"
     run_cmd zfs snapshot "${FULL_SNAP_NAME}"
+    if [ -n "$KEEP_UNTIL" ]; then 
+        zfs_set_keep_until "${LOCAL_DS}" "$KEEP_UNTIL"
+    fi
 
     log "Creating bookmark ${FULL_BOOKMARK_NAME}"
     run_cmd zfs bookmark "${FULL_SNAP_NAME}" "${FULL_BOOKMARK_NAME}"
 
+    log "Local snapshot ${FULL_SNAP_NAME} created"
+}
+
+zfs_cleanup_if_expired() {
+    local obj="$1"
+    local prop="custom:keep-until"
+    local today
+    today=$(date +%Y%m%d)
+
+        keep_until=$(zfs get -H -o value "$prop" "$obj" 2>/dev/null)
+
+        if [[ "$keep_until" == "-" || -z "$keep_until" || "$today" -gt "$keep_until" ]]; then
+            if [[ "${DRY_RUN:-0}" == "1" ]]; then
+                 log "[DRY-RUN] Would destroy $obj (keep-until=$keep_until)"
+            else
+                log "Destroying $obj (keep-until=$keep_until)"
+                zfs destroy "$obj"
+            fi
+        fi
+}
+
+
+snapshot_rotate() {
     # Rotate local snapshots (keep only the newest KEEP_LOCAL)
     ALL_SNAPS=($(zfs list -H -t snapshot -o name -s creation -r "${LOCAL_DS}"))
     NUM=${#ALL_SNAPS[@]}
@@ -241,12 +292,9 @@ snapshot_local() {
     if [ "${NUM}" -gt "${KEEP_LOCAL}" ]; then
         TO_REMOVE=("${ALL_SNAPS[@]:0:NUM-KEEP_LOCAL}")
         for OLD_SNAP in "${TO_REMOVE[@]}"; do
-            log "Destroying old snapshot ${OLD_SNAP}"
-            run_cmd zfs destroy "${OLD_SNAP}"
+            zfs_cleanup_if_expired "${OLD_SNAP}"
         done
     fi
-
-    log "Local snapshot ${FULL_SNAP_NAME} created"
 }
 
 # ============================================================
@@ -392,7 +440,40 @@ send_increment() {
 # ============================================================
 
 copy_manifests() {
-    run_cmd "rsync -a --copy-links --delete /etc/pve/qemu-server /${LOCAL_DS}/"
+    if [ -d /etc/pve/qemu-server ]; then 
+        run_cmd "rsync -a --copy-links --delete /etc/pve/qemu-server /${LOCAL_DS}/"
+    fi
+}
+
+# zfs_snapshot_rename () {
+#     local OLD_NAME=${1}
+#     local NEW_NAME=${2}
+#     local SRC=$(zfs list -H -t snapshot -o name ${LOCAL_DS}@${OLD_NAME} 2>/dev/null)
+#     if [ -n "${SRC}" ]; then
+#         local DST=$(zfs list -H -t snapshot -o name ${LOCAL_DS}@${NEW_NAME} 2>/dev/null)
+#         if [ -n "${DST}" ]; then
+#             log "Snapsot ${DST} already exists. Remove it"
+#             run_cmd zfs destroy -r ${DST}
+#         fi
+#         run_cmd zfs rename ${LOCAL_DS}@${1} ${LOCAL_DS}@${2}
+#     else
+#         log "Snapsot ${SRC} does not exists."
+#     fi
+# }
+
+zfs_snap_remove_if_exists() {
+    local NAME=${1}
+    local SNAP=$(zfs list -H -t snapshot -o name ${LOCAL_DS}@${NAME} 2>/dev/null)
+    if [ -n "${SNAP}" ]; then
+        log "Snapsot ${SNAP} already exists. Remove it"
+        run_cmd zfs destroy ${SNAP}
+    fi
+    # If destroy snapdhot, also destroy bookmark
+    local MARK=$(zfs list -H -t bookmark -o name ${LOCAL_DS}#${NAME} 2>/dev/null)
+    if [ -n "${MARK}" ]; then
+        log "Bookmark ${MARK} already exists. Remove it"
+        run_cmd zfs destroy $MARK
+    fi
 }
 
 # ============================================================
@@ -402,14 +483,31 @@ copy_manifests() {
 run_cmd "zfs list ${LOCAL_DS}" || exit 1
 
 copy_manifests
-snapshot_local "${DATE}"
+
+if [ -n "${SET_NAME}" ]; then
+    SNAP_NAME=${SET_NAME}
+else
+    SNAP_NAME=${DATE}
+fi 
+
+zfs_snap_remove_if_exists "${SNAP_NAME}"
+
+snapshot_local "${SNAP_NAME}"
+
+# Rename snaphot (morning or first day of month run)
+#if [ -n "${SET_NAME}" ]; then
+#    snapshot_rename "${DATE}" "${SET_NAME}"
+#fi
 
 # Nearline backup (every run)
-send_increment "X" "${DATE}" "${BACKUP_USER}" "${BACKUP_HOST}" "${BACKUP_PATH}"
+send_increment "X" "${SNAP_NAME}" "${BACKUP_USER}" "${BACKUP_HOST}" "${BACKUP_PATH}"
+
+snapshot_rotate "${LOCAL_DS}"
 
 # Offsite archive (monthly)
 if [ -n "$FORCE_ARCHIVE" -o "${DAY}" = "01" ]; then
-    send_increment "X" "${DATE}" "${ARCHIVE_USER}" "${ARCHIVE_HOST}" "${ARCHIVE_PATH}" "${YEAR}-${MONTH}-${DAY}"
+    #send_increment "X" "${SNAP_NAME}" "${ARCHIVE_USER}" "${ARCHIVE_HOST}" "${ARCHIVE_PATH}" "${YEAR}-${MONTH}-${DAY}"
+    send_increment "X" "${SNAP_NAME}" "${ARCHIVE_USER}" "${ARCHIVE_HOST}" "${ARCHIVE_PATH}" "${YEAR}-${MONTH}-${DAY}"
 fi
 
 log "Backup & archive workflow completed."
