@@ -15,55 +15,19 @@
 
 set -eou pipefail
 
-# ============================================================
-# Default configuration (policy-level parameters)
-# ============================================================
+CONFIG_FILE="/etc/vm-backup.conf"
 
-DRY_RUN=0
-DEBUG=0
-
-# Local dataset to back up
-LOCAL_DS="tank/test"
-
-# Backup server (nearline backups)
-BACKUP_USER="root"
-BACKUP_HOST="nfs8"
-BACKUP_PATH="tank/backup/${HOSTNAME}"
-
-# Archive server (offsite, long-term storage)
-ARCHIVE_USER="root"
-ARCHIVE_HOST="nfs9"
-ARCHIVE_PATH="tank/archive/${HOSTNAME}"
-FORCE_ARCHIVE=
-
-# Local retention policy
-KEEP_LOCAL=50   # number of latest snapshots to keep locally
-KEEP_UNTIL=     # YYMMDD format date 
-SET_NAME=       # Set snapshot name
-
-# Transfer tuning
-MBUFFER_MEM="2G"
-MBUFFER_SPEED=""
-
-# Interactive mode:
-#   1 = show progress (manual run)
-#   0 = silent (cron)
-if  [[ -t 0 ]]; then 
-    INTERACTIVE=1
+if [[ -f "$CONFIG_FILE" ]]; then
+    # shellcheck source=/etc/vm-backup.conf
+    source "$CONFIG_FILE"
 else
-    INTERACTIVE=0
+    echo "Config file $CONFIG_FILE not found"
+    exit 1
 fi
-    
-
-# Time-related variables
-DATE=$(date +%Y-%m-%d-%H%M%S)
-DAY=$(date +%d)
-MONTH=$(date +%b)
-YEAR=$(date +%Y)
-
-PIDFILE=/var/run/zfs-send-recv.pid
 
 # Prevent double start
+
+acquire_lock() {
 if [[ -f $PIDFILE ]]; then
     oldpid=$(<"$PIDFILE")
     if kill -0 "$oldpid" 2>/dev/null; then
@@ -78,6 +42,7 @@ fi
 echo $$ >"$PIDFILE"
 # PID file is always deleted, even if the script crashes or is interrupted.
 trap 'rm -f "$PIDFILE"' EXIT
+}
 
 # ============================================================
 # Logs messages to syslog and optionally stdout.
@@ -146,7 +111,7 @@ Options:
 
   --dataset DATASET
         Local ZFS dataset to back up.
-        Default: ${LOCAL_DS}
+        Default: ${LOCAL_DATASTORE}
 
   --backup-host HOST
         Backup server hostname.
@@ -154,7 +119,7 @@ Options:
 
   --backup-dataset DATASET
         ZFS dataset on backup server.
-        Default: ${BACKUP_PATH}
+        Default: ${BACKUP_DATASTORE}
 
   --archive
         Force offsite archive replication.
@@ -166,7 +131,7 @@ Options:
 
   --archive-dataset DATASET
         ZFS dataset on archive server.
-        Default: ${ARCHIVE_PATH}
+        Default: ${ARCHIVE_DATASTORE}
 
   --keep COUNT
         Number of local snapshots to retain.
@@ -231,7 +196,7 @@ while true; do
             shift 2
             ;;
         --dataset)
-            LOCAL_DS="$2"
+            LOCAL_DATASTORE="$2"
             shift 2
             ;;
         --backup-host)
@@ -239,7 +204,7 @@ while true; do
             shift 2
             ;;
         --backup-dataset)
-            BACKUP_PATH="$2"
+            BACKUP_DATASTORE="$2"
             shift 2
             ;;
         --archive-host)
@@ -247,7 +212,7 @@ while true; do
             shift 2
             ;;
         --archive-dataset)
-            ARCHIVE_PATH="$2"
+            ARCHIVE_DATASTORE="$2"
             shift 2
             ;;
         --keep)
@@ -259,7 +224,7 @@ while true; do
             shift 2
             ;;
         --rename)
-            SET_NAME="$2"
+            SNAPSHOT_NAME="${2//\\}" # Remove "\" from name
             shift 2
             ;;
         --)
@@ -291,26 +256,6 @@ run_cmd() {
 }
 
 # ============================================================
-# Sets a custom ZFS property indicating snapshot expiration.
-# Arguments:
-#   $1  Dataset or snapshot
-#   $2  Expiration date (YYYYMMDD)
-# ============================================================
-
-zfs_set_keep_until() {
-    local dataset="$1"
-    local date="$2"
-    local prop="custom:keep-until"
-
-    # basic YYYYMMDD validation
-    if [[ "$date" =~ ^[0-9]{8}$ ]]; then
-       run_cmd zfs set "$prop=$date" "$dataset"
-    else
-       log "Invalid date format (expected YYYYMMDD)"
-    fi
-}
-
-# ============================================================
 # 1) Local snapshot creation + rotation + bookmark
 #
 # Policy:
@@ -319,20 +264,24 @@ zfs_set_keep_until() {
 # ============================================================
 
 snapshot_local() {
-    local SNAP_NAME="$1"
-    local FULL_SNAP_NAME="${LOCAL_DS}@${SNAP_NAME}"
-    local FULL_BOOKMARK_NAME="${LOCAL_DS}#${SNAP_NAME}"
+    local SNAPSHOT="$1"
+    local FULL_SNAPSHOT_NAME="${LOCAL_DATASTORE}@${SNAPSHOT}"
+    local FULL_BOOKMARK_NAME="${LOCAL_DATASTORE}#${SNAPSHOT}"
 
-    log "Creating snapshot ${FULL_SNAP_NAME}"
-    run_cmd zfs snapshot "${FULL_SNAP_NAME}"
-    if [ -n "$KEEP_UNTIL" ]; then 
-        zfs_set_keep_until "${LOCAL_DS}" "$KEEP_UNTIL"
+    zfs_snap_remove_if_exists "localhost" "${LOCAL_DATASTORE}" "${SNAPSHOT}"
+
+    log "Creating snapshot ${FULL_SNAPSHOT_NAME}"
+    run_cmd zfs snapshot "${FULL_SNAPSHOT_NAME}"
+    log "Local snapshot ${FULL_SNAPSHOT_NAME} created"
+
+    if [[ "$KEEP_UNTIL" =~ ^[0-9]{8}$ ]]; then 
+         run_cmd zfs set custom:keep-until=$KEEP_UNTIL ${FULL_SNAPSHOT_NAME}
     fi
 
     log "Creating bookmark ${FULL_BOOKMARK_NAME}"
-    run_cmd zfs bookmark "${FULL_SNAP_NAME}" "${FULL_BOOKMARK_NAME}"
+    run_cmd zfs bookmark "${FULL_SNAPSHOT_NAME}" "${FULL_BOOKMARK_NAME}"
+    log "Local bookmark${FULL_BOOKMARK_NAME} created"
 
-    log "Local snapshot ${FULL_SNAP_NAME} created"
 }
 
 zfs_cleanup_if_expired() {
@@ -350,7 +299,7 @@ zfs_cleanup_if_expired() {
 
 snapshot_rotate() {
     # Rotate local snapshots (keep only the newest KEEP_LOCAL)
-    ALL_SNAPS=($(zfs list -H -t snapshot -o name -s creation -r "${LOCAL_DS}"))
+    ALL_SNAPS=($(zfs list -H -t snapshot -o name -s creation -r "${LOCAL_DATASTORE}"))
     NUM=${#ALL_SNAPS[@]}
 
     if [ "${NUM}" -gt "${KEEP_LOCAL}" ]; then
@@ -415,7 +364,7 @@ get_recent_bookmark() {
             LOCAL_GUIDS_ORDER+=("$GUID")  # Maintain insertion order
         fi
         debug 2 "BM_BY_GUID['$GUID']=${BM_BY_GUID[$GUID]}"
-    done < <(zfs list -H -t snapshot,bookmark -o name,guid -S creation -r "${LOCAL_DS}")
+    done < <(zfs list -H -t snapshot,bookmark -o name,guid -S creation -r "${LOCAL_DATASTORE}")
 
     debug 2 "LOCAL_GUIDS_ORDER=${LOCAL_GUIDS_ORDER[*]}"
 
@@ -501,21 +450,21 @@ send_increment() {
 
 copy_manifests() {
     if [ -d /etc/pve/qemu-server ]; then 
-        run_cmd "rsync -a --copy-links --delete /etc/pve/qemu-server /${LOCAL_DS}/"
+        run_cmd "rsync -a --copy-links --delete /etc/pve/qemu-server /${LOCAL_DATASTORE}/"
     fi
 }
 
 # zfs_snapshot_rename () {
 #     local OLD_NAME=${1}
 #     local NEW_NAME=${2}
-#     local SRC=$(zfs list -H -t snapshot -o name ${LOCAL_DS}@${OLD_NAME} 2>/dev/null)
+#     local SRC=$(zfs list -H -t snapshot -o name ${LOCAL_DATASTORE}@${OLD_NAME} 2>/dev/null)
 #     if [ -n "${SRC}" ]; then
-#         local DST=$(zfs list -H -t snapshot -o name ${LOCAL_DS}@${NEW_NAME} 2>/dev/null)
+#         local DST=$(zfs list -H -t snapshot -o name ${LOCAL_DATASTORE}@${NEW_NAME} 2>/dev/null)
 #         if [ -n "${DST}" ]; then
 #             log "Snapsot ${DST} already exists. Remove it"
 #             run_cmd zfs destroy -r ${DST}
 #         fi
-#         run_cmd zfs rename ${LOCAL_DS}@${1} ${LOCAL_DS}@${2}
+#         run_cmd zfs rename ${LOCAL_DATASTORE}@${1} ${LOCAL_DS}@${2}
 #     else
 #         log "Snapsot ${SRC} does not exists."
 #     fi
@@ -526,11 +475,13 @@ zfs_snap_remove_if_exists() {
     local DATASTORE=${2}
     local SNAP=${3}
     local PRE_CMD=
-    if [ ! "$HOST" = "localhost" ];then 
+    if [ ! "$HOST" = "localhost" ]; then 
         PRE_CMD="ssh -q $HOST"
     fi
 
-    local SNAP_EXISTS=$($PRE_CMD zfs list -H -t snapshot -o name ${DATASTORE}@${SNAP} 2>/dev/null)
+    log "Check $PRE_CMD zfs list -H -t snapshot -o name ${DATASTORE}@${SNAP}"
+
+    local SNAP_EXISTS=$($PRE_CMD zfs list -H -t snapshot -o name "${DATASTORE}@${SNAP}" 2>/dev/null)
     if [ -n "${SNAP_EXISTS}" ]; then
         log "Snapsot ${DATASTORE}@${SNAP} already exists on $HOST. Remove it"
         run_cmd "$PRE_CMD zfs destroy ${DATASTORE}@${SNAP}"
@@ -547,35 +498,30 @@ zfs_snap_remove_if_exists() {
 # Main workflow
 # ============================================================
 
+acquire_lock
+
 check_dependicies
 
-run_cmd "zfs list -H -o name ${LOCAL_DS}" || exit 1
+run_cmd "zfs list -H -o name ${LOCAL_DATASTORE}" || exit 1
 
 copy_manifests
 
-if [ -n "${SET_NAME}" ]; then
-    SNAP_NAME=${SET_NAME}
-else
-    SNAP_NAME=${DATE}
+zfs_snap_remove_if_exists "localhost" "${LOCAL_DATASTORE}" "${SNAPSHOT_NAME}"
+
+if [ -z "${SNAPSHOT_NAME}" ]; then
+    SNAPSHOT_NAME=${DATE}
 fi 
 
-zfs_snap_remove_if_exists localhost "${LOCAL_DS}" "${SNAP_NAME}"
-
-snapshot_local "${SNAP_NAME}"
-
-# Rename snaphot (morning or first day of month run)
-#if [ -n "${SET_NAME}" ]; then
-#    snapshot_rename "${DATE}" "${SET_NAME}"
-#fi
+snapshot_local "${SNAPSHOT_NAME}"
 
 # Nearline backup (every run)
-send_increment "${LOCAL_DS}" "${SNAP_NAME}" "${BACKUP_USER}" "${BACKUP_HOST}" "${BACKUP_PATH}"
+send_increment "${LOCAL_DATASTORE}" "${SNAPSHOT_NAME}" "${BACKUP_USER}" "${BACKUP_HOST}" "${BACKUP_DATASTORE}"
 
-snapshot_rotate "${LOCAL_DS}"
+snapshot_rotate "${LOCAL_DATASTORE}"
 
 # Offsite archive (monthly)
-if [ -n "$FORCE_ARCHIVE" -o "${DAY}" = "01" ]; then
-    send_increment "${LOCAL_DS}" "${SNAP_NAME}" "${ARCHIVE_USER}" "${ARCHIVE_HOST}" "${ARCHIVE_PATH}" 
+if [ $FORCE_ARCHIVE -eq 1 -o "${DAY}" = "01" ]; then
+    send_increment "${LOCAL_DATASTORE}" "${SNAPSHOT_NAME}" "${ARCHIVE_USER}" "${ARCHIVE_HOST}" "${ARCHIVE_DATASTORE}" 
 fi
 
 log "Backup & archive workflow completed."

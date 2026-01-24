@@ -1,0 +1,47 @@
+
+# ============================================================
+# Default configuration (policy-level parameters)
+# ============================================================
+
+DRY_RUN=0
+DEBUG=0
+
+# Local dataset to back up
+LOCAL_DATASTORE="tank/test"
+
+# Backup server (nearline backups)
+BACKUP_USER="root"
+BACKUP_HOST="nfs8"
+BACKUP_DATASTORE="tank/backup/${HOSTNAME}"
+
+# Archive server (offsite, long-term storage)
+ARCHIVE_USER="root"
+ARCHIVE_HOST="nfs9"
+ARCHIVE_DATASTORE="tank/archive/${HOSTNAME}"
+FORCE_ARCHIVE=0
+
+# Local retention policy
+KEEP_LOCAL=50           # number of latest snapshots to keep locally
+KEEP_UNTIL=             # YYYYMMDD format date 
+SNAPSHOT_NAME=""        # Set snapshot name
+
+# Transfer tuning
+MBUFFER_MEM="2G"
+MBUFFER_SPEED=""
+
+# Interactive mode:
+#   1 = show progress (manual run)
+#   0 = silent (cron)
+if  [[ -t 0 ]]; then 
+    INTERACTIVE=1
+else
+    INTERACTIVE=0
+fi
+    
+# Time-related variables
+DATE=$(date +%Y-%m-%d-%H%M%S)
+DAY=$(date +%d)
+MONTH=$(date +%b)
+YEAR=$(date +%Y)
+
+PIDFILE=/var/run/zfs-send-recv.pid
