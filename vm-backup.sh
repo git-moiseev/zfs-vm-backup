@@ -13,7 +13,7 @@
 #  - cron-friendly dry-run and debug modes
 #
 
-set -eo pipefail
+set -eou pipefail
 
 # ============================================================
 # Default configuration (policy-level parameters)
@@ -34,6 +34,7 @@ BACKUP_PATH="tank/backup/${HOSTNAME}"
 ARCHIVE_USER="root"
 ARCHIVE_HOST="nfs9"
 ARCHIVE_PATH="tank/archive/${HOSTNAME}"
+FORCE_ARCHIVE=
 
 # Local retention policy
 KEEP_LOCAL=50   # number of latest snapshots to keep locally
@@ -79,7 +80,8 @@ echo $$ >"$PIDFILE"
 trap 'rm -f "$PIDFILE"' EXIT
 
 # ============================================================
-# Logging helpers
+# Logs messages to syslog and optionally stdout.
+# Output to stdout only happens in interactive mode.
 # ============================================================
 
 log() {
@@ -89,49 +91,112 @@ log() {
     logger -t backup "$*"
 }
 
+# ============================================================
+# Emits debug output based on DEBUG verbosity level.
+# Arguments:
+#   $1  Debug level (default: 1)
+#   $*  Debug message
+# ============================================================
+
 debug() {
     local LEVEL=${1:-1}
     if [ ${LEVEL} -le ${DEBUG} ]; then
         shift # Remove $1 from $*
         echo "[$(date +'%Y-%m-%d %H:%M:%S')] $*"
+        logger -t backup "[DEBUG $LEVEL] $*"
     fi
 }
 
 # ============================================================
-# Usage / help
+# Ensures required userland tools are installed.
+# Currently supports Debian-based systems only.
+# ============================================================
+
+check_dependicies() {
+for PROG in mbuffer pv numfmt; do
+     if [ ! -x /usr/bin/$PROG ]; then
+          apt install -y $PROG
+     fi
+done
+}
+
+
+# ============================================================
+# Prints CLI usage information and exits.
 # ============================================================
 
 usage() {
 cat <<EOF
-Usage: vm-backup.sh [options]
+Usage: vm-backup.sh [OPTIONS]
+
+ZFS snapshot, backup and archive replication for Proxmox.
 
 Options:
-  --help                    Show this help and exit
-  --dry-run                 Show commands without executing them
-  --archive                 Force send datastore to archive
-  --debug LEVEL             Enable verbose debug output LEVELS 1, 2, 3
+  -h, --help
+        Show this help and exit.
 
-  --dataset DATASET         Local ZFS dataset to backup
-                             (default: tank/test)
+  --dry-run
+        Print commands without executing them.
 
-  --backup-host HOST        Backup server hostname
-                             (default: nfs8)
+  --debug LEVEL
+        Enable debug output.
+        LEVEL:
+          1  basic debug messages
+          2  include ZFS GUID and bookmark logic
+          3  very verbose (command tracing)
 
-  --backup-dataset DATASET  ZFS dataset for backups on backup server
-                             (default: tank/backup)
+  --dataset DATASET
+        Local ZFS dataset to back up.
+        Default: ${LOCAL_DS}
 
-  --archive-host HOST       Archive server hostname (offsite)
-                             (default: nfs9)
+  --backup-host HOST
+        Backup server hostname.
+        Default: ${BACKUP_HOST}
 
-  --archive-dataset DATASET ZFS dataset for archives on archive server
-                             (default: tank/archive)
+  --backup-dataset DATASET
+        ZFS dataset on backup server.
+        Default: ${BACKUP_PATH}
+
+  --archive
+        Force offsite archive replication.
+        (Archive logic must be enabled in script.)
+
+  --archive-host HOST
+        Archive server hostname.
+        Default: ${ARCHIVE_HOST}
+
+  --archive-dataset DATASET
+        ZFS dataset on archive server.
+        Default: ${ARCHIVE_PATH}
+
+  --keep COUNT
+        Number of local snapshots to retain.
+        Default: ${KEEP_LOCAL}
+
+  --keep-until YYYYMMDD
+        Expiration date for created snapshots.
+        Sets ZFS property: custom:keep-until
+
+  --rename SNAPSHOT_NAME
+        Override automatic snapshot name.
+        Default: timestamp (YYYY-MM-DD-HHMMSS)
 
 Examples:
-  vm-backup.sh --dry-run
-  vm-backup.sh --dataset tank/vm
-  vm-backup.sh --debug --dry-run
+  vm-backup.sh
+        Run backup with defaults.
+
+  vm-backup.sh --dry-run --debug 2
+        Show all commands and bookmark matching logic.
+
+  vm-backup.sh --dataset tank/vm --keep 30
+        Back up a different dataset with shorter retention.
+
+  vm-backup.sh --rename manual-rollback
+        Create a snapshot with a fixed name.
+
 EOF
 }
+
 
 # ============================================================
 # Argument parsing (getopt)
@@ -218,13 +283,20 @@ run_cmd() {
 
     if [ ${DRY_RUN} -eq 1 ]; then
         log "[DRY-RUN] ${CMD}"
-    elif [ ${DEBUG} -eq 1 ]; then
+    elif [ ${DEBUG} -gt 1 ]; then
         log "[DEBUG] ${CMD}"
         eval "${CMD}"
     else
         eval "${CMD}"
     fi
 }
+
+# ============================================================
+# Sets a custom ZFS property indicating snapshot expiration.
+# Arguments:
+#   $1  Dataset or snapshot
+#   $2  Expiration date (YYYYMMDD)
+# ============================================================
 
 zfs_set_keep_until() {
     local dataset="$1"
@@ -245,7 +317,6 @@ zfs_set_keep_until() {
 # Policy:
 #  - Always create a snapshot
 #  - Immediately create a bookmark with the same name
-#  - Keep only the latest KEEP_LOCAL snapshots locally
 # ============================================================
 
 snapshot_local() {
@@ -298,8 +369,8 @@ snapshot_rotate() {
 }
 
 # ============================================================
-# 2) Find the most recent local bookmark matching
-#    any remote snapshot GUID
+# Find the most recent local bookmark matching
+# any remote snapshot GUID
 # Sets a global variables LAST_RECENT_BOOKMARK, REMOTE_SNAP_TO_DELETE
 # If matched bookmark does not exists or has descendants on remote 
 # side they must to be deleted before send datastream
@@ -342,6 +413,7 @@ get_recent_bookmark() {
     while read -r NAME GUID; do
         NAME="${NAME//[$'\r\n']}"
         GUID="${GUID//[$'\r\n']}"
+        debug 2 "NAME=$NAME, GUID=$GUID"
         # Append to existing list if duplicate GUID
         if [ -n "${BM_BY_GUID[$GUID]:-}" ]; then
             BM_BY_GUID["$GUID"]="${BM_BY_GUID[$GUID]} $NAME"
@@ -356,7 +428,7 @@ get_recent_bookmark() {
 
     # --- Walk remote snapshots newest → oldest ---
     for R_GUID in "${REMOTE_GUIDS_ORDER[@]}"; do
-        if [ -n "${BM_BY_GUID[$R_GUID]}" ]; then
+        if [ -n "${BM_BY_GUID[$R_GUID]:-}" ]; then
             # Pick the newest local bookmark for this GUID (first in list)
             LAST_RECENT_BOOKMARK="${BM_BY_GUID[$R_GUID]%% *}"
             return 0
@@ -367,38 +439,29 @@ get_recent_bookmark() {
 }
 
 # ============================================================
-# 3)Determine it is a first bookmark for today
-# ============================================================
-
-is_first_bookmark_today() {
-    local bm="$1"
-    local today_start min_bm="" min_ts=""
-
-    today_start=$(date -d 'today 00:00' +%s)
-
-    while read -r name ts; do
-        (( ts < today_start )) && continue
-        if [[ -z $min_ts || ts -lt min_ts ]]; then
-            min_ts=$ts
-            min_bm=$name
-        fi
-    done < <(zfs list -H -t bookmark -o name,creation -p rpool/test)
-
-    [[ -n $min_bm && $bm == "$min_bm" ]]
-}
-
-# ============================================================
-# 4) Incremental (or full) send to remote host
+# Incremental (or full) send to remote host
+# Sends a ZFS snapshot to a remote host using incremental replication.
+# Falls back to full send if no common bookmark is found.
+#
+# Arguments:
+#   $1  Local dataset
+#   $2  Snapshot name
+#   $3  Remote user
+#   $4  Remote host
+#   $5  Remote dataset
 # ============================================================
 
 send_increment() {
+    local DATASTORE="$1"
     local SNAP="$2"
     local REMOTE_USER="$3"
     local REMOTE_HOST="$4"
     local REMOTE_DS="$5"
-    local NEW_SNAP_NAME="${6:-}"
 
-    get_recent_bookmark "${LOCAL_DS}" "${REMOTE_USER}" "${REMOTE_HOST}" "${REMOTE_DS}"
+    # get_recent_bookmark sets variables 
+    # LAST_RECENT_BOOKMARK
+    # REMOTE_SNAP_TO_DELETE
+    get_recent_bookmark "${DATASTORE}" "${REMOTE_USER}" "${REMOTE_HOST}" "${REMOTE_DS}"
     log "Found recent bookmark: ${LAST_RECENT_BOOKMARK}"
 
     # Cleanup incompatible remote snapshots
@@ -410,17 +473,20 @@ send_increment() {
         done
     fi
 
+    zfs_snap_remove_if_exists "${REMOTE_HOST}" "${REMOTE_DS}" "${SNAP}"
+
     if [ -n "${LAST_RECENT_BOOKMARK}" ]; then
-        log "Incremental send from ${LAST_RECENT_BOOKMARK} to ${LOCAL_DS}@${SNAP}"
-        SEND_CMD="zfs send -c -i ${LAST_RECENT_BOOKMARK} ${LOCAL_DS}@${SNAP}"
+        log "Incremental send from ${LAST_RECENT_BOOKMARK} to ${DATASTORE}@${SNAP} to ${REMOTE_HOST} ${REMOTE_DS}"
+        SEND_CMD="zfs send -c -i ${LAST_RECENT_BOOKMARK} ${DATASTORE}@${SNAP}"
     else
-        log "Full send of ${LOCAL_DS}@${SNAP}"
-        SEND_CMD="zfs send -c ${LOCAL_DS}@${SNAP}"
-        run_cmd "ssh ${REMOTE_USER}@${REMOTE_HOST} mkdir -p ${REMOTE_DS}"
+        log "Full send of ${DATASTORE}@${SNAP} to ${REMOTE_HOST} ${REMOTE_DS}"
+        SEND_CMD="zfs send -c ${DATASTORE}@${SNAP}"
+        run_cmd "ssh -q ${REMOTE_USER}@${REMOTE_HOST} mkdir -p ${REMOTE_DS}"
     fi
 
     if [ "${INTERACTIVE}" -eq 1 ]; then
         STREAM_SIZE=$(${SEND_CMD} -Pn | tail -1 | awk '{print $2}')
+        log $(echo ${STREAM_SIZE} | numfmt --to=iec --format "Tolal %f will be sent") "($STREAM_SIZE bytes)"
         CMD="${SEND_CMD} | pv -s ${STREAM_SIZE} | mbuffer -q -s 1M -m ${MBUFFER_MEM} -L ${MBUFFER_SPEED} | ssh ${REMOTE_USER}@${REMOTE_HOST} zfs recv -Fu ${REMOTE_DS}"
     else
         CMD="${SEND_CMD} | mbuffer -q -s 1M -m ${MBUFFER_MEM} -L ${MBUFFER_SPEED} | ssh ${REMOTE_USER}@${REMOTE_HOST} zfs recv -Fu ${REMOTE_DS}"
@@ -428,10 +494,6 @@ send_increment() {
 
     run_cmd "${CMD}"
 
-    # Optional rename (used for monthly archives)
-    if [[ -n "$NEW_SNAP_NAME" ]]; then
-        run_cmd "ssh ${REMOTE_USER}@${REMOTE_HOST} zfs rename ${REMOTE_DS}@${SNAP} ${REMOTE_DS}@${NEW_SNAP_NAME}"
-    fi
 }
 
 
@@ -462,17 +524,24 @@ copy_manifests() {
 # }
 
 zfs_snap_remove_if_exists() {
-    local NAME=${1}
-    local SNAP=$(zfs list -H -t snapshot -o name ${LOCAL_DS}@${NAME} 2>/dev/null)
-    if [ -n "${SNAP}" ]; then
-        log "Snapsot ${SNAP} already exists. Remove it"
-        run_cmd zfs destroy ${SNAP}
+    local HOST=${1}
+    local DATASTORE=${2}
+    local SNAP=${3}
+    local PRE_CMD=
+    if [ ! "$HOST" = "localhost" ];then 
+        PRE_CMD="ssh -q $HOST"
+    fi
+
+    local SNAP_EXISTS=$($PRE_CMD zfs list -H -t snapshot -o name ${DATASTORE}@${SNAP} 2>/dev/null)
+    if [ -n "${SNAP_EXISTS}" ]; then
+        log "Snapsot ${DATASTORE}@${SNAP} already exists on $HOST. Remove it"
+        run_cmd "$PRE_CMD zfs destroy ${DATASTORE}@${SNAP}"
     fi
     # If destroy snapdhot, also destroy bookmark
-    local MARK=$(zfs list -H -t bookmark -o name ${LOCAL_DS}#${NAME} 2>/dev/null)
-    if [ -n "${MARK}" ]; then
-        log "Bookmark ${MARK} already exists. Remove it"
-        run_cmd zfs destroy $MARK
+    local MARK_EXISTS=$($PRE_CMD zfs list -H -t bookmark -o name ${DATASTORE}#${SNAP} 2>/dev/null)
+    if [ -n "${MARK_EXISTS}" ]; then
+        log "Bookmark ${DATASTORE}#${SNAP} already exists on $HOST.. Remove it"
+        run_cmd "$PRE_CMD zfs destroy ${DATASTORE}#${SNAP}"
     fi
 }
 
@@ -480,7 +549,9 @@ zfs_snap_remove_if_exists() {
 # Main workflow
 # ============================================================
 
-run_cmd "zfs list ${LOCAL_DS}" || exit 1
+check_dependicies
+
+run_cmd "zfs list -H -o name ${LOCAL_DS}" || exit 1
 
 copy_manifests
 
@@ -490,7 +561,7 @@ else
     SNAP_NAME=${DATE}
 fi 
 
-zfs_snap_remove_if_exists "${SNAP_NAME}"
+zfs_snap_remove_if_exists localhost "${LOCAL_DS}" "${SNAP_NAME}"
 
 snapshot_local "${SNAP_NAME}"
 
@@ -500,14 +571,13 @@ snapshot_local "${SNAP_NAME}"
 #fi
 
 # Nearline backup (every run)
-send_increment "X" "${SNAP_NAME}" "${BACKUP_USER}" "${BACKUP_HOST}" "${BACKUP_PATH}"
+send_increment "${LOCAL_DS}" "${SNAP_NAME}" "${BACKUP_USER}" "${BACKUP_HOST}" "${BACKUP_PATH}"
 
 snapshot_rotate "${LOCAL_DS}"
 
 # Offsite archive (monthly)
 if [ -n "$FORCE_ARCHIVE" -o "${DAY}" = "01" ]; then
-    #send_increment "X" "${SNAP_NAME}" "${ARCHIVE_USER}" "${ARCHIVE_HOST}" "${ARCHIVE_PATH}" "${YEAR}-${MONTH}-${DAY}"
-    send_increment "X" "${SNAP_NAME}" "${ARCHIVE_USER}" "${ARCHIVE_HOST}" "${ARCHIVE_PATH}" "${YEAR}-${MONTH}-${DAY}"
+    send_increment "${LOCAL_DS}" "${SNAP_NAME}" "${ARCHIVE_USER}" "${ARCHIVE_HOST}" "${ARCHIVE_PATH}" 
 fi
 
 log "Backup & archive workflow completed."
