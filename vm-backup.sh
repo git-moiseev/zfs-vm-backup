@@ -120,7 +120,6 @@ for PROG in mbuffer pv numfmt; do
 done
 }
 
-
 # ============================================================
 # Prints CLI usage information and exits.
 # ============================================================
@@ -345,15 +344,9 @@ zfs_cleanup_if_expired() {
         keep_until=$(zfs get -H -o value "$prop" "$obj" 2>/dev/null)
 
         if [[ "$keep_until" == "-" || -z "$keep_until" || "$today" -gt "$keep_until" ]]; then
-            if [[ "${DRY_RUN:-0}" == "1" ]]; then
-                 log "[DRY-RUN] Would destroy $obj (keep-until=$keep_until)"
-            else
-                log "Destroying $obj (keep-until=$keep_until)"
-                zfs destroy "$obj"
-            fi
+             run_cmd zfs destroy "$obj"
         fi
 }
-
 
 snapshot_rotate() {
     # Rotate local snapshots (keep only the newest KEEP_LOCAL)
@@ -409,7 +402,7 @@ get_recent_bookmark() {
 
     debug 2 "REMOTE_GUIDS_ORDER=${REMOTE_GUIDS_ORDER[*]}"
 
-    # --- Local bookmarks ---
+    # --- Local bookmarks and snaphots ---
     while read -r NAME GUID; do
         NAME="${NAME//[$'\r\n']}"
         GUID="${GUID//[$'\r\n']}"
@@ -422,7 +415,7 @@ get_recent_bookmark() {
             LOCAL_GUIDS_ORDER+=("$GUID")  # Maintain insertion order
         fi
         debug 2 "BM_BY_GUID['$GUID']=${BM_BY_GUID[$GUID]}"
-    done < <(zfs list -H -t bookmark -o name,guid -S creation -r "${LOCAL_DS}")
+    done < <(zfs list -H -t snapshot,bookmark -o name,guid -S creation -r "${LOCAL_DS}")
 
     debug 2 "LOCAL_GUIDS_ORDER=${LOCAL_GUIDS_ORDER[*]}"
 
@@ -462,7 +455,7 @@ send_increment() {
     # LAST_RECENT_BOOKMARK
     # REMOTE_SNAP_TO_DELETE
     get_recent_bookmark "${DATASTORE}" "${REMOTE_USER}" "${REMOTE_HOST}" "${REMOTE_DS}"
-    log "Found recent bookmark: ${LAST_RECENT_BOOKMARK}"
+    log "Found recent bookmark: ${LAST_RECENT_BOOKMARK} against "${REMOTE_HOST}" "${REMOTE_DS}""
 
     # Cleanup incompatible remote snapshots
     if [ -n "${REMOTE_SNAP_TO_DELETE}" ]; then
@@ -485,7 +478,12 @@ send_increment() {
     fi
 
     if [ "${INTERACTIVE}" -eq 1 ]; then
-        STREAM_SIZE=$(${SEND_CMD} -Pn | tail -1 | awk '{print $2}')
+        if [ ${DRY_RUN} -eq 1 ]; then 
+            log "If DRY_RUN cannot caclulate actualy STREAM_SIZE without ${DATASTORE}@${SNAP} exists"
+            STREAM_SIZE=1000000000
+        else 
+            STREAM_SIZE=$(${SEND_CMD} -Pn | tail -1 | awk '{print $2}')
+        fi
         log $(echo ${STREAM_SIZE} | numfmt --to=iec --format "Tolal %f will be sent") "($STREAM_SIZE bytes)"
         CMD="${SEND_CMD} | pv -s ${STREAM_SIZE} | mbuffer -q -s 1M -m ${MBUFFER_MEM} -L ${MBUFFER_SPEED} | ssh ${REMOTE_USER}@${REMOTE_HOST} zfs recv -Fu ${REMOTE_DS}"
     else
